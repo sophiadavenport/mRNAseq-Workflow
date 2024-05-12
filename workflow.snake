@@ -1,0 +1,164 @@
+names = ['ADrep1', 'ADrep2', 'P0rep1', 'P0rep2', 'P4rep1', 'P4rep2', 'P7rep1', 'P7rep2']
+readpairs = ['R1', 'R2']
+
+rule all:
+	input:
+		'results/multiqc_report.html', 'results/GRCm39.primary_assembly.genome.fa.gz', 'results/gencode.vM34.primary_assembly.annotation.gtf', expand('results/{name}.flagstats.txt', name = names), 'results/verse_concat_filtered.csv', 'results/id2gene.txt'
+
+# Initial Quality Control: 
+rule fastqc:
+	input:
+		fastq = 'samples/full_files/{name}_{read}.fastq.gz',
+	output:
+		fastqc = 'results/{name}_{read}_fastqc.html'
+	params:
+		outdir = 'results/'
+	shell:
+		'''
+		fastqc {input.fastq} -o {params.outdir}
+		'''
+
+rule multiqc:
+	input:
+		fq = expand('results/{name}_{read}_fastqc.html', name = names , read = readpairs)
+	output:
+		results = 'results/multiqc_report.html'
+	params:
+		results = 'results/'
+	shell:
+		'''
+		multiqc {params.results} -o {params.results} -f
+		'''
+
+#Downloading primary assembly genome from Gencode:
+rule get_m39:
+	output:
+		genome = 'results/GRCm39.primary_assembly.genome.fa.gz'
+	params:
+		m39_path = 'https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_mouse/release_M34/GRCm39.primary_assembly.genome.fa.gz'
+	shell:
+		'''
+		wget -P results/ {params.m39_path}
+		'''
+
+#Downloading annotation file from Gencode:
+rule get_m39_gtf:
+	output:
+		annotation_zipped = 'results/gencode.vM34.primary_assembly.annotation.gtf.gz'
+	params:
+		m39_gtf = 'https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_mouse/release_M34/gencode.vM34.primary_assembly.annotation.gtf.gz'
+	shell:
+		'''
+		wget -P results/ {params.m39_gtf}
+		'''
+
+rule unzip:
+	input:
+		annotation_zipped = 'results/gencode.vM34.primary_assembly.annotation.gtf.gz'
+	output:
+		annotation = 'results/gencode.vM34.primary_assembly.annotation.gtf'
+	shell:
+		'''
+		gunzip -c {input.annotation_zipped} > {output.annotation}
+		'''
+
+#Aligning to the reference genome:	
+rule star:
+	input: 
+		R1 = 'samples/full_files/{names}_R1.fastq.gz',
+		R2 = 'samples/full_files/{names}_R2.fastq.gz',
+		genomedir = 'samples/m39_star/'
+	output:	
+		output = "results/{names}.Aligned.out.bam"
+	params:
+		outdir = 'results/{names}.'
+	threads: 8
+	shell:
+		'''
+		STAR --runThreadN {threads} --genomeDir {input.genomedir} --readFilesIn {input.R1} {input.R2} --readFilesCommand zcat --outSAMtype BAM Unsorted --outFileNamePrefix {params.outdir} 
+		'''
+
+#Post-alignment quality control:
+rule samtools_flagstat:
+	input: 
+		bam = "results/{name}.Aligned.out.bam"
+	output: 
+		flags = "results/{name}.flagstats.txt"
+	shell: 
+		'''
+		samtools flagstat {input.bam} > {output.flags}
+		'''
+
+#Removing blacklisted regions:
+rule filter_blacklist:
+	input:
+		bed = 'results/intersection.bed', blacklist = 'results/hg38-blacklist.v2.bed'
+	output:
+		filtered_bed = 'results/filtered_intersection.bed'
+	conda:
+		'envs/bedtools_env.yml'
+	shell:
+		'''
+		bedtools intersect -v -a {input.bed} -b {input.blacklist} -bed > {output.filtered_bed}
+		'''
+
+rule unzip_gtf:
+	input:
+		annotation_zipped = 'results/gencode.v45.primary_assembly.annotation.gtf.gz'
+	output:
+		annotation = 'results/gencode.v45.primary_assembly.annotation.gtf'
+	shell:
+		'''
+		gunzip -c {input.annotation_zipped} > {output.annotation}
+		'''
+
+#Using verse to obtain annotations:
+rule run_verse:
+    input:
+        files = 'results/{names}.Aligned.out.bam',
+        annotation = 'results/gencode.vM34.primary_assembly.annotation.gtf'
+    output:
+        verse_files = 'results/{names}.exon.txt'
+    params:
+        prefix = 'results/{names}'
+    shell:
+        '''
+        verse -S -a {input.annotation} -o {params.prefix} {input.files}
+        '''
+
+#Concatinating annotation into a matrix:
+rule concat_verse:
+    input:
+        verse_file = expand('results/{name}.exon.txt', name = names)
+    output:
+        cts_matrix = 'results/verse_concat.csv'
+    shell:
+        '''
+        python concat_df.py -i {input.verse_file} -o {output.cts_matrix}
+        '''
+
+#Filtering counts matrix:
+rule filter_cts:
+    input:
+        verse = 'results/verse_concat.csv'
+    output:
+        filter = 'results/verse_concat_filtered.csv'
+    shell:
+        '''
+        python filter_cts_mat.py -i {input.verse} -o {output.filter}
+        '''
+
+#Mapping gene IDs to symbols:
+rule txn_mapping:
+    input:
+        gtf = 'results/gencode.vM34.primary_assembly.annotation.gtf'
+    output:
+        map = 'results/id2gene.txt'
+    shell:
+        '''
+        python parse_gtf.py -i {input.gtf} -o {output.map}
+        '''
+
+module load R
+
+Rscript deseq.R
